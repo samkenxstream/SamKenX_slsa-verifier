@@ -2,8 +2,8 @@ package gcb
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -25,6 +25,10 @@ var GCBBuilderIDs = []string{
 	"https://cloudbuild.googleapis.com/GoogleHostedWorker@v0.2",
 	"https://cloudbuild.googleapis.com/GoogleHostedWorker@v0.3",
 }
+
+var regionalKeyRegex = regexp.MustCompile(`^projects\/verified-builder\/locations\/(.*)\/keyRings\/attestor\/cryptoKeys\/builtByGCB\/cryptoKeyVersions\/1$`)
+
+var errorSubstitutionError = errors.New("GCB substitution variable error")
 
 type v01IntotoStatement struct {
 	intoto.StatementHeader
@@ -79,31 +83,20 @@ func ProvenanceFromBytes(payload []byte) (*Provenance, error) {
 	}, nil
 }
 
-func payloadFromEnvelope(env *dsselib.Envelope) ([]byte, error) {
-	payload, err := base64.StdEncoding.DecodeString(env.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", serrors.ErrorInvalidDssePayload, err.Error())
-	}
-	if payload == nil {
-		return nil, fmt.Errorf("%w: empty payload", serrors.ErrorInvalidFormat)
-	}
-	return payload, nil
-}
-
-func (self *Provenance) isVerified() error {
+func (p *Provenance) isVerified() error {
 	// Check that the signature is verified.
-	if self.verifiedIntotoStatement == nil ||
-		self.verifiedProvenance == nil {
+	if p.verifiedIntotoStatement == nil ||
+		p.verifiedProvenance == nil {
 		return serrors.ErrorNoValidSignature
 	}
 	return nil
 }
 
-func (self *Provenance) GetVerifiedIntotoStatement() ([]byte, error) {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) GetVerifiedIntotoStatement() ([]byte, error) {
+	if err := p.isVerified(); err != nil {
 		return nil, err
 	}
-	d, err := json.Marshal(self.verifiedIntotoStatement)
+	d, err := json.Marshal(p.verifiedIntotoStatement)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", serrors.ErrorInvalidDssePayload, err.Error())
 	}
@@ -113,15 +106,15 @@ func (self *Provenance) GetVerifiedIntotoStatement() ([]byte, error) {
 // VerifyMetadata verifies additional metadata contained in the provenance, which is not part
 // of the DSSE payload or headers. It is part of the payload returned by
 // `gcloud artifacts docker images describe image:tag --format json --show-provenance`.
-func (self *Provenance) VerifyMetadata(provenanceOpts *options.ProvenanceOpts) error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifyMetadata(provenanceOpts *options.ProvenanceOpts) error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
 	if provenanceOpts == nil {
 		return nil
 	}
-	prov := self.verifiedProvenance
+	prov := p.verifiedProvenance
 
 	if prov.Kind != "BUILD" {
 		return fmt.Errorf("%w: expected kind to be 'BUILD', got %s", serrors.ErrorInvalidFormat, prov.Kind)
@@ -140,8 +133,8 @@ func (self *Provenance) VerifyMetadata(provenanceOpts *options.ProvenanceOpts) e
 
 // VerifySummary verifies the content of the `image_summary` structure
 // returned by `gcloud artifacts docker images describe image:tag --format json --show-provenance`.
-func (self *Provenance) VerifySummary(provenanceOpts *options.ProvenanceOpts) error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifySummary(provenanceOpts *options.ProvenanceOpts) error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
@@ -150,43 +143,43 @@ func (self *Provenance) VerifySummary(provenanceOpts *options.ProvenanceOpts) er
 	}
 
 	// Validate the digest.
-	if self.gcloudProv.ImageSummary.Digest != "sha256:"+provenanceOpts.ExpectedDigest {
+	if p.gcloudProv.ImageSummary.Digest != "sha256:"+provenanceOpts.ExpectedDigest {
 		return fmt.Errorf("%w: expected summary digest '%s', got '%s'",
 			serrors.ErrorMismatchHash, provenanceOpts.ExpectedDigest,
-			self.gcloudProv.ImageSummary.Digest)
+			p.gcloudProv.ImageSummary.Digest)
 	}
 
 	// Validate the qualified digest.
-	if !strings.HasSuffix(self.gcloudProv.ImageSummary.FullyQualifiedDigest,
+	if !strings.HasSuffix(p.gcloudProv.ImageSummary.FullyQualifiedDigest,
 		"sha256:"+provenanceOpts.ExpectedDigest) {
 		return fmt.Errorf("%w: expected fully qualifiedd digest '%s', got '%s'",
 			serrors.ErrorMismatchHash, provenanceOpts.ExpectedDigest,
-			self.gcloudProv.ImageSummary.FullyQualifiedDigest)
+			p.gcloudProv.ImageSummary.FullyQualifiedDigest)
 	}
 	return nil
 }
 
 // VerifyTextProvenance verifies the text provenance prepended
 // to the provenance.This text mirrors the DSSE payload but is human-readable.
-func (self *Provenance) VerifyTextProvenance() error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifyTextProvenance() error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
 	// Note: there is an additional field `metadata.buildInvocationId` which
 	// is not part of the specs but is present. This field is currently ignored during comparison.
 	unverifiedTextIntotoStatement := v01IntotoStatement{
-		StatementHeader: self.verifiedProvenance.Build.UnverifiedTextIntotoStatement.StatementHeader,
-		Predicate:       self.verifiedProvenance.Build.UnverifiedTextIntotoStatement.SlsaProvenance,
+		StatementHeader: p.verifiedProvenance.Build.UnverifiedTextIntotoStatement.StatementHeader,
+		Predicate:       p.verifiedProvenance.Build.UnverifiedTextIntotoStatement.SlsaProvenance,
 	}
 
 	// Note: DeepEqual() has problem with time comparisons: https://github.com/onsi/gomega/issues/264
 	// but this should not affect us since both times are supposed to have the same string and
 	// they are both taken from a string representation.
 	// We do not use cmp.Equal() because it *can* panic and is intended for unit tests only.
-	if !reflect.DeepEqual(unverifiedTextIntotoStatement, *self.verifiedIntotoStatement) {
+	if !reflect.DeepEqual(unverifiedTextIntotoStatement, *p.verifiedIntotoStatement) {
 		return fmt.Errorf("%w: diff '%s'", serrors.ErrorMismatchIntoto,
-			cmp.Diff(unverifiedTextIntotoStatement, *self.verifiedIntotoStatement))
+			cmp.Diff(unverifiedTextIntotoStatement, *p.verifiedIntotoStatement))
 	}
 
 	return nil
@@ -194,12 +187,12 @@ func (self *Provenance) VerifyTextProvenance() error {
 
 // VerifyIntotoHeaders verifies the headers are intoto format and the expected
 // slsa predicate.
-func (self *Provenance) VerifyIntotoHeaders() error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifyIntotoHeaders() error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
-	statement := self.verifiedIntotoStatement
+	statement := p.verifiedIntotoStatement
 	// https://in-toto.io/Statement/v0.1
 	if statement.StatementHeader.Type != intoto.StatementInTotoV01 {
 		return fmt.Errorf("%w: expected statement header type '%s', got '%s'",
@@ -264,12 +257,12 @@ func validateRecipeType(builderID utils.TrustedBuilderID, recipeType string) err
 // - in the recipe type
 // - the recipe argument type
 // - the predicate builder ID.
-func (self *Provenance) VerifyBuilder(builderOpts *options.BuilderOpts) (*utils.TrustedBuilderID, error) {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifyBuilder(builderOpts *options.BuilderOpts) (*utils.TrustedBuilderID, error) {
+	if err := p.isVerified(); err != nil {
 		return nil, err
 	}
 
-	statement := self.verifiedIntotoStatement
+	statement := p.verifiedIntotoStatement
 	predicateBuilderID := statement.Predicate.Builder.ID
 
 	// Sanity check the builderID.
@@ -326,12 +319,12 @@ func getAsString(m map[string]interface{}, key string) (string, error) {
 }
 
 // VerifySubjectDigest verifies the sha256 of the subject.
-func (self *Provenance) VerifySubjectDigest(expectedHash string) error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifySubjectDigest(expectedHash string) error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
-	statement := self.verifiedIntotoStatement
+	statement := p.verifiedIntotoStatement
 	for _, subject := range statement.StatementHeader.Subject {
 		digestSet := subject.Digest
 		hash, exists := digestSet["sha256"]
@@ -348,17 +341,21 @@ func (self *Provenance) VerifySubjectDigest(expectedHash string) error {
 }
 
 // Verify source URI in provenance statement.
-func (self *Provenance) VerifySourceURI(expectedSourceURI string, builderID utils.TrustedBuilderID) error {
-	if err := self.isVerified(); err != nil {
+func (p *Provenance) VerifySourceURI(expectedSourceURI string, builderID utils.TrustedBuilderID) error {
+	if err := p.isVerified(); err != nil {
 		return err
 	}
 
-	statement := self.verifiedIntotoStatement
+	statement := p.verifiedIntotoStatement
 	materials := statement.Predicate.Materials
 	if len(materials) == 0 {
 		return fmt.Errorf("%w: no materials", serrors.ErrorInvalidDssePayload)
 	}
 	uri := materials[0].URI
+	// NOTE: the material URI did not contain 'git+' for GCB versions <= v0.3.
+	// A change occurred sometimes in v0.3 witout version bump.
+	// Versions >= 0.3 contain the prefix (https://github.com/slsa-framework/slsa-verifier/pull/519).
+	uri = strings.TrimPrefix(uri, "git+")
 
 	// It is possible that GCS builds at level 2 use GCS sources, prefixed by gs://.
 	if strings.HasPrefix(uri, "https://") && !strings.HasPrefix(expectedSourceURI, "https://") {
@@ -401,79 +398,127 @@ func (self *Provenance) VerifySourceURI(expectedSourceURI string, builderID util
 	return err
 }
 
-func (self *Provenance) VerifyBranch(branch string) error {
+func (p *Provenance) VerifyBranch(branch string) error {
 	return fmt.Errorf("%w: GCB branch verification", serrors.ErrorNotSupported)
 }
 
-func (self *Provenance) VerifyTag(tag string) error {
-	return fmt.Errorf("%w: GCB tag verification", serrors.ErrorNotSupported)
+func (p *Provenance) VerifyTag(expectedTag string) error {
+	provenanceTag, err := p.getTag()
+	if err != nil {
+		return fmt.Errorf("%w: %v", serrors.ErrorMismatchTag, err.Error())
+	}
+
+	if provenanceTag != expectedTag {
+		return fmt.Errorf("%w: expected '%s', got '%s'",
+			serrors.ErrorMismatchTag, expectedTag, provenanceTag)
+	}
+	return nil
 }
 
-func (self *Provenance) VerifyVersionedTag(tag string) error {
-	return fmt.Errorf("%w: GCB versioned-tag verification", serrors.ErrorNotSupported)
+func (p *Provenance) VerifyVersionedTag(expectedTag string) error {
+	provenanceTag, err := p.getTag()
+	if err != nil {
+		return fmt.Errorf("%w: %v", serrors.ErrorMismatchVersionedTag, err.Error())
+	}
+	return utils.VerifyVersionedTag(provenanceTag, expectedTag)
 }
 
-func decodeSignature(s string) ([]byte, error) {
-	var errs []error
-	// First try the std decoding.
-	rsig, err := base64.StdEncoding.DecodeString(s)
-	if err == nil {
-		// No error, return the value.
-		return rsig, nil
+func (p *Provenance) getTag() (string, error) {
+	if err := p.isVerified(); err != nil {
+		return "", err
 	}
-	errs = append(errs, err)
 
-	// If std decoding failed, try URL decoding.
-	// We try both because we encountered decoding failures
-	// during our tests. The DSSE documentation does not prescribe
-	// which encoding to use: `Either standard or URL-safe encoding is allowed`.
-	// https://github.com/secure-systems-lab/dsse/blob/27ce241dec575998dee8967c3c76d4edd5d6ee73/envelope.md#standard-json-envelope.
-	rsig, err = base64.URLEncoding.DecodeString(s)
-	if err == nil {
-		// No error, return the value.
-		return rsig, nil
+	statement := p.verifiedIntotoStatement
+	provenanceTag, err := getSubstitutionsField(statement, "TAG_NAME")
+	if err != nil {
+		return "", err
 	}
-	errs = append(errs, err)
 
-	return nil, fmt.Errorf("%w: %v", serrors.ErrorInvalidEncoding, errs)
+	return provenanceTag, nil
+}
+
+func getSubstitutionsField(statement *v01IntotoStatement, name string) (string, error) {
+	arguments := statement.Predicate.Recipe.Arguments
+
+	argsMap, ok := arguments.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("%w: cannot cast arguments as map", errorSubstitutionError)
+	}
+
+	substitutions, ok := argsMap["substitutions"]
+	if !ok {
+		return "", fmt.Errorf("%w: no 'substitutions' field", errorSubstitutionError)
+	}
+
+	m, ok := substitutions.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("%w: cannot convert substitutions to a map", errorSubstitutionError)
+	}
+
+	value, ok := m[name]
+	if !ok {
+		return "", fmt.Errorf("%w: no entry '%v' in substitution map", errorSubstitutionError, name)
+	}
+
+	valueStr, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%w: value '%v' is not a string", errorSubstitutionError, value)
+	}
+
+	return valueStr, nil
 }
 
 // verifySignatures iterates over all the signatures in the DSSE and verifies them.
 // It succeeds if one of them can be verified.
-func (self *Provenance) verifySignatures(prov *provenance) error {
+func (p *Provenance) verifySignatures(prov *provenance) error {
 	// Verify the envelope type. It should be an intoto type.
 	if prov.Envelope.PayloadType != intoto.PayloadType {
 		return fmt.Errorf("%w: expected payload type '%s', got %s",
 			serrors.ErrorInvalidDssePayload, intoto.PayloadType, prov.Envelope.PayloadType)
 	}
 
-	payload, err := payloadFromEnvelope(&prov.Envelope)
+	payload, err := utils.PayloadFromEnvelope(&prov.Envelope)
 	if err != nil {
 		return err
 	}
 
 	payloadHash := sha256.Sum256(payload)
-
 	// Verify the signatures.
 	if len(prov.Envelope.Signatures) == 0 {
 		return fmt.Errorf("%w: no signatures found in envelope", serrors.ErrorNoValidSignature)
 	}
 
 	var errs []error
-	regex := regexp.MustCompile(`^projects\/verified-builder\/locations\/(.*)\/keyRings\/attestor\/cryptoKeys\/builtByGCB\/cryptoKeyVersions\/1$`)
+
 	for _, sig := range prov.Envelope.Signatures {
-		match := regex.FindStringSubmatch(sig.KeyID)
-		if len(match) == 2 {
-			// Create a public key instance for this region.
-			region := match[1]
-			pubKey, err := keys.PublicKeyNew(region)
+		var region string
+		if sig.KeyID == keys.GlobalPAEKeyID {
+			// If the signature is signed with the global PAE key, use a DSSE verifier
+			// to verify the DSSE/PAE-encoded signature.
+			region = keys.GlobalPAEPublicKeyName
+			globalPaeKey, err := keys.NewGlobalPAEKey()
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+
+			err = globalPaeKey.VerifyPAESignature(&prov.Envelope)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		} else if match := regionalKeyRegex.FindStringSubmatch(sig.KeyID); len(match) == 2 {
+			// If the signature is signed with a regional key, verify the legacy
+			// signing which is over the envelope (not PAE-encoded).
+			region = match[1]
+			pubKey, err := keys.NewPublicKey(region)
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
 
 			// Decode the signature.
-			rsig, err := decodeSignature(sig.Sig)
+			rsig, err := utils.DecodeSignature(sig.Sig)
 			if err != nil {
 				errs = append(errs, err)
 				continue
@@ -485,31 +530,33 @@ func (self *Provenance) verifySignatures(prov *provenance) error {
 				errs = append(errs, err)
 				continue
 			}
-
-			var statement v01IntotoStatement
-			if err := json.Unmarshal(payload, &statement); err != nil {
-				return fmt.Errorf("%w: %s", serrors.ErrorInvalidDssePayload, err.Error())
-			}
-			self.verifiedIntotoStatement = &statement
-			self.verifiedProvenance = prov
-			fmt.Fprintf(os.Stderr, "Verification succeeded with region key '%s'\n", region)
-			return nil
+		} else {
+			continue
 		}
+
+		var statement v01IntotoStatement
+		if err := json.Unmarshal(payload, &statement); err != nil {
+			return fmt.Errorf("%w: %s", serrors.ErrorInvalidDssePayload, err.Error())
+		}
+		p.verifiedIntotoStatement = &statement
+		p.verifiedProvenance = prov
+		fmt.Fprintf(os.Stderr, "Verification succeeded with region key '%s'\n", region)
+		return nil
 	}
 
 	return fmt.Errorf("%w: %v", serrors.ErrorNoValidSignature, errs)
 }
 
 // VerifySignature verifiers the signature for a provenance.
-func (self *Provenance) VerifySignature() error {
-	if len(self.gcloudProv.ProvenanceSummary.Provenance) == 0 {
+func (p *Provenance) VerifySignature() error {
+	if len(p.gcloudProv.ProvenanceSummary.Provenance) == 0 {
 		return fmt.Errorf("%w: no provenance found", serrors.ErrorInvalidDssePayload)
 	}
 
 	// Iterate over all provenances available.
 	var errs []error
-	for i := range self.gcloudProv.ProvenanceSummary.Provenance {
-		err := self.verifySignatures(&self.gcloudProv.ProvenanceSummary.Provenance[i])
+	for i := range p.gcloudProv.ProvenanceSummary.Provenance {
+		err := p.verifySignatures(&p.gcloudProv.ProvenanceSummary.Provenance[i])
 		if err != nil {
 			errs = append(errs, err)
 			continue

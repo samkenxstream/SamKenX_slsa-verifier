@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -17,10 +18,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/sigstore/cosign/pkg/cosign"
 	"github.com/sigstore/cosign/pkg/oci"
-	"github.com/sigstore/cosign/pkg/oci/layout"
 
 	"github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier/verify"
 	serrors "github.com/slsa-framework/slsa-verifier/v2/errors"
@@ -38,9 +37,12 @@ func pString(s string) *string {
 const TEST_DIR = "./testdata"
 
 var (
-	GHA_ARTIFACT_PATH_BUILDERS  = []string{"gha_go", "gha_generic"}
-	GHA_ARTIFACT_IMAGE_BUILDERS = []string{"gha_generic_container"}
-	GCB_ARTIFACT_IMAGE_BUILDERS = []string{"gcb_container"}
+	GHA_ARTIFACT_PATH_BUILDERS = []string{"gha_go", "gha_generic"}
+	// TODO(https://github.com/slsa-framework/slsa-verifier/issues/485): Merge this with
+	// GHA_ARTIFACT_PATH_BUILDERS.
+	GHA_ARTIFACT_DOCKER_BUILDERS = []string{"gha_docker-based"}
+	GHA_ARTIFACT_IMAGE_BUILDERS  = []string{"gha_generic_container"}
+	GCB_ARTIFACT_IMAGE_BUILDERS  = []string{"gcb_container"}
 )
 
 func getBuildersAndVersions(t *testing.T,
@@ -465,15 +467,15 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 		{
 			name:        "annotated tag",
 			artifacts:   []string{"annotated-tag"},
-			source:      "github.com/laurentsimon/slsa-on-github-test",
-			pversiontag: pString("v5.0.1"),
+			source:      "github.com/asraa/slsa-on-github-test",
+			pversiontag: pString("v1.5.0"),
 			noversion:   true,
 		},
 		{
 			name:        "no branch",
 			artifacts:   []string{"annotated-tag"},
-			source:      "github.com/laurentsimon/slsa-on-github-test",
-			pversiontag: pString("v5.0.1"),
+			source:      "github.com/asraa/slsa-on-github-test",
+			pversiontag: pString("v1.5.0"),
 			pbranch:     pString("main"),
 			err:         serrors.ErrorMismatchBranch,
 			noversion:   true,
@@ -484,7 +486,7 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 			artifacts: []string{"workflow-inputs"},
 			source:    "github.com/laurentsimon/slsa-on-github-test",
 			inputs: map[string]string{
-				"release_version": "v1.2.3",
+				"release_version": "(for example, 0.1.0)",
 				"some_bool":       "true",
 				"some_integer":    "123",
 			},
@@ -495,7 +497,7 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 			artifacts: []string{"workflow-inputs"},
 			source:    "github.com/laurentsimon/slsa-on-github-test",
 			inputs: map[string]string{
-				"release_version": "v1.2.3",
+				"release_version": "(for example, 0.1.0)",
 				"some_bool":       "true",
 				"missing_field":   "123",
 			},
@@ -507,21 +509,12 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 			artifacts: []string{"workflow-inputs"},
 			source:    "github.com/laurentsimon/slsa-on-github-test",
 			inputs: map[string]string{
-				"release_version": "v1.2.3",
+				"release_version": "(for example, 0.1.0)",
 				"some_bool":       "true",
 				"some_integer":    "321",
 			},
 			err:       serrors.ErrorMismatchWorkflowInputs,
 			noversion: true,
-		},
-		// Regression test of sharded UUID.
-		{
-			name:       "regression: sharded uuids",
-			artifacts:  []string{"binary-linux-amd64-sharded"},
-			source:     "github.com/slsa-framework/slsa-verifier",
-			pbranch:    pString("release/v1.0"),
-			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml"),
-			noversion:  true,
 		},
 	}
 	for _, tt := range tests {
@@ -529,7 +522,6 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Avoid rate limiting by not running the tests in parallel.
 			// t.Parallel()
-
 			checkVersions := getBuildersAndVersions(t, "v1.2.2", tt.builders, GHA_ARTIFACT_PATH_BUILDERS)
 			if tt.noversion {
 				checkVersions = []string{""}
@@ -584,7 +576,7 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 				// before GA. Add the tests for tag verification.
 				if version != "" && semver.Compare(version, "v1.0.0") > 0 {
 					builderIDs = append(builderIDs, []*string{
-						// pString(builder + "@" + sv),
+						pString(builder + "@" + sv),
 						pString(builder + "@refs/tags/" + sv),
 					}...)
 				}
@@ -605,6 +597,8 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 						BuildWorkflowInputs: tt.inputs,
 					}
 
+					// The outBuilderID is the actual builder ID from the provenance.
+					// This is always long form for the GHA builders.
 					outBuilderID, err := cmd.Exec(context.Background(), artifacts)
 					if !errCmp(err, tt.err) {
 						t.Errorf("%v: %v", v, cmp.Diff(err, tt.err, cmpopts.EquateErrors()))
@@ -619,15 +613,6 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 						if err := outBuilderID.Matches(tt.outBuilderID, false); err != nil {
 							t.Errorf(fmt.Sprintf("matches failed (1): %v", err))
 						}
-					}
-
-					if bid == nil {
-						continue
-					}
-
-					// Validate against builderID we generated automatically.
-					if err := outBuilderID.Matches(*bid, false); err != nil {
-						t.Errorf(fmt.Sprintf("matches failed (2): %v", err))
 					}
 
 					// Smoke test against the CLI command
@@ -661,6 +646,18 @@ func Test_runVerifyGHAArtifactPath(t *testing.T) {
 					if !errCmp(cliErr, tt.err) {
 						t.Errorf("%v: %v", v, cmp.Diff(cliErr, tt.err, cmpopts.EquateErrors()))
 					}
+
+					if bid == nil {
+						continue
+					}
+
+					// If we have a generated a user-provided bid, then validate it against the
+					// resulting builderID returned by the provenance check.
+					// Since this a GHA and the certificate ID is in long form,
+					// we pass `allowRef = true`.
+					if err := outBuilderID.Matches(*bid, true); err != nil {
+						t.Errorf(fmt.Sprintf("matches failed (2): %v", err))
+					}
 				}
 			}
 		})
@@ -674,44 +671,13 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 	container.RunCosignImageVerification = func(ctx context.Context,
 		image string, co *cosign.CheckOpts,
 	) ([]oci.Signature, bool, error) {
+		key := "@sha256:"
+		i := strings.Index(image, key)
+		if i < 0 {
+			return nil, false, fmt.Errorf("cannot find '%v' in '%v'", key, image)
+		}
+		image = image[:i]
 		return cosign.VerifyLocalImageAttestations(ctx, image, co)
-	}
-
-	// TODO: Is there a more uniform way of handling getting image digest for both
-	// remote and local images?
-	localDigestComputeFn := func(image string) (string, error) {
-		// This is copied from cosign's VerifyLocalImageAttestation code:
-		// https://github.com/sigstore/cosign/blob/fdceee4825dc5d56b130f3f431aab93137359e79/pkg/cosign/verify.go#L654
-		se, err := layout.SignedImageIndex(image)
-		if err != nil {
-			return "", err
-		}
-
-		var h v1.Hash
-		// Verify either an image index or image.
-		ii, err := se.SignedImageIndex(v1.Hash{})
-		if err != nil {
-			return "", err
-		}
-		i, err := se.SignedImage(v1.Hash{})
-		if err != nil {
-			return "", err
-		}
-		switch {
-		case ii != nil:
-			h, err = ii.Digest()
-			if err != nil {
-				return "", err
-			}
-		case i != nil:
-			h, err = i.Digest()
-			if err != nil {
-				return "", err
-			}
-		default:
-			return "", errors.New("must verify either an image index or image")
-		}
-		return strings.TrimPrefix(h.String(), "sha256:"), nil
 	}
 
 	builder := "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml"
@@ -731,64 +697,64 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 		// When true, this does not iterate over all builder versions.
 		noversion bool
 	}{
-		// {
-		// 	name:     "valid main branch default",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/slsa-framework/example-package",
-		// },
-		// {
-		// 	name:       "valid main branch default - invalid builderID",
-		// 	artifact:   "container_workflow_dispatch",
-		// 	source:     "github.com/slsa-framework/example-package",
-		// 	pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/not-trusted.yml"),
-		// 	err:        serrors.ErrorUntrustedReusableWorkflow,
-		// },
-		// {
-		// 	name:     "valid main branch set",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/slsa-framework/example-package",
-		// 	pbranch:  pString("main"),
-		// },
+		{
+			name:     "valid main branch default",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/slsa-framework/example-package",
+		},
+		{
+			name:       "valid main branch default - invalid builderID",
+			artifact:   "container_workflow_dispatch",
+			source:     "github.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/not-trusted.yml"),
+			err:        serrors.ErrorUntrustedReusableWorkflow,
+		},
+		{
+			name:     "valid main branch set",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/slsa-framework/example-package",
+			pbranch:  pString("main"),
+		},
 
-		// {
-		// 	name:     "wrong branch master",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/slsa-framework/example-package",
-		// 	pbranch:  pString("master"),
-		// 	err:      serrors.ErrorMismatchBranch,
-		// },
-		// {
-		// 	name:     "wrong source append A",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/slsa-framework/example-packageA",
-		// 	err:      serrors.ErrorMismatchSource,
-		// },
-		// {
-		// 	name:     "wrong source prepend A",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "Agithub.com/slsa-framework/example-package",
-		// 	err:      serrors.ErrorMismatchSource,
-		// },
-		// {
-		// 	name:     "wrong source middle A",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/Aslsa-framework/example-package",
-		// 	err:      serrors.ErrorMismatchSource,
-		// },
-		// {
-		// 	name:     "tag no match empty tag workflow_dispatch",
-		// 	artifact: "container_workflow_dispatch",
-		// 	source:   "github.com/slsa-framework/example-package",
-		// 	ptag:     pString("v1.2.3"),
-		// 	err:      serrors.ErrorMismatchTag,
-		// },
-		// {
-		// 	name:        "versioned tag no match empty tag workflow_dispatch",
-		// 	artifact:    "container_workflow_dispatch",
-		// 	source:      "github.com/slsa-framework/example-package",
-		// 	pversiontag: pString("v1"),
-		// 	err:         serrors.ErrorInvalidSemver,
-		// },
+		{
+			name:     "wrong branch master",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/slsa-framework/example-package",
+			pbranch:  pString("master"),
+			err:      serrors.ErrorMismatchBranch,
+		},
+		{
+			name:     "wrong source append A",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/slsa-framework/example-packageA",
+			err:      serrors.ErrorMismatchSource,
+		},
+		{
+			name:     "wrong source prepend A",
+			artifact: "container_workflow_dispatch",
+			source:   "Agithub.com/slsa-framework/example-package",
+			err:      serrors.ErrorMismatchSource,
+		},
+		{
+			name:     "wrong source middle A",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/Aslsa-framework/example-package",
+			err:      serrors.ErrorMismatchSource,
+		},
+		{
+			name:     "tag no match empty tag workflow_dispatch",
+			artifact: "container_workflow_dispatch",
+			source:   "github.com/slsa-framework/example-package",
+			ptag:     pString("v1.2.3"),
+			err:      serrors.ErrorMismatchTag,
+		},
+		{
+			name:        "versioned tag no match empty tag workflow_dispatch",
+			artifact:    "container_workflow_dispatch",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v1"),
+			err:         serrors.ErrorInvalidSemver,
+		},
 	}
 	for _, tt := range tests {
 		tt := tt // Re-initializing variable so it is not changed while executing the closure below
@@ -821,6 +787,13 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 					builderIDs = []*string{tt.pBuilderID}
 				}
 
+				// Compute the digest and append it to the image so that's it 'immutable'.
+				digest, err := localDigestCompute(image)
+				if err != nil {
+					panic(fmt.Sprintf("digest computation %v", err))
+				}
+				image = fmt.Sprintf("%v@sha256:%v", image, digest)
+
 				for _, bid := range builderIDs {
 					cmd := verify.VerifyImageCommand{
 						SourceURI:        tt.source,
@@ -828,7 +801,6 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 						BuilderID:        bid,
 						SourceTag:        tt.ptag,
 						SourceVersionTag: tt.pversiontag,
-						DigestFn:         localDigestComputeFn,
 					}
 
 					outBuilderID, err := cmd.Exec(context.Background(), []string{image})
@@ -837,7 +809,7 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 					}
 
 					if err != nil {
-						return
+						continue
 					}
 
 					// Validate against test's expected builderID, if provided.
@@ -848,10 +820,14 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 					}
 
 					if bid == nil {
-						return
+						continue
 					}
-					// Validate against builderID we generated automatically.
-					if err := outBuilderID.Matches(*bid, false); err != nil {
+
+					// If we have a generated a user-provided bid, then validate it against the
+					// resulting builderID returned by the provenance check.
+					// Since this a GHA and the certificate ID is in long form,
+					// we pass `allowRef = true`.
+					if err := outBuilderID.Matches(*bid, true); err != nil {
 						t.Errorf(fmt.Sprintf("matches failed: %v", err))
 					}
 				}
@@ -860,35 +836,28 @@ func Test_runVerifyGHAArtifactImage(t *testing.T) {
 	}
 }
 
+func localDigestCompute(image string) (string, error) {
+	filename := image + ".digest"
+	digest, err := os.ReadFile(filename)
+	if err != nil {
+		return "", fmt.Errorf("ReadFile fail: %w", err)
+	}
+	return strings.TrimPrefix(string(digest), "sha256:"), nil
+}
+
 func Test_runVerifyGCBArtifactImage(t *testing.T) {
 	t.Parallel()
-
-	// TODO: Is there a more uniform way of handling getting image digest for both
-	// remote and local images?
-	localDigestComputeFn := func(image string) (string, error) {
-		// This is copied from cosign's VerifyLocalImageAttestation code:
-		// https://github.com/sigstore/cosign/blob/fdceee4825dc5d56b130f3f431aab93137359e79/pkg/cosign/verify.go#L654
-		se, err := layout.SignedImageIndex(image)
-		if err != nil {
-			return "", err
-		}
-
-		h, err := se.Digest()
-		if err != nil {
-			return "", err
-		}
-
-		return strings.TrimPrefix(h.String(), "sha256:"), nil
-	}
-
 	builder := "https://cloudbuild.googleapis.com/GoogleHostedWorker"
 	tests := []struct {
 		name           string
 		artifact       string
 		artifactDigest map[string]string
+		noDigest       bool
 		remote         bool
 		provenance     string
 		source         string
+		ptag           *string
+		pversiontag    *string
 		pBuilderID     *string
 		outBuilderID   string
 		err            error
@@ -1088,6 +1057,92 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 			source:     "github.com/laurentsimon/gcb-tests",
 			err:        serrors.ErrorNoValidSignature,
 		},
+		{
+			name:       "tag match",
+			artifact:   "gcloud-container-github-tag",
+			provenance: "gcloud-container-github-tag.json",
+			source:     "github.com/slsa-framework/example-package",
+			ptag:       pString("v33.0.4"),
+			minversion: "v0.3",
+		},
+		{
+			name:       "tag mismatch major",
+			artifact:   "gcloud-container-github-tag",
+			provenance: "gcloud-container-github-tag.json",
+			source:     "github.com/slsa-framework/example-package",
+			ptag:       pString("v34.0.4"),
+			minversion: "v0.3",
+			err:        serrors.ErrorMismatchTag,
+		},
+		{
+			name:       "tag mismatch minor",
+			artifact:   "gcloud-container-github-tag",
+			provenance: "gcloud-container-github-tag.json",
+			source:     "github.com/slsa-framework/example-package",
+			ptag:       pString("v33.1.4"),
+			minversion: "v0.3",
+			err:        serrors.ErrorMismatchTag,
+		},
+		{
+			name:       "tag mismatch patch",
+			artifact:   "gcloud-container-github-tag",
+			provenance: "gcloud-container-github-tag.json",
+			source:     "github.com/slsa-framework/example-package",
+			ptag:       pString("v33.0.5"),
+			minversion: "v0.3",
+			err:        serrors.ErrorMismatchTag,
+		},
+		{
+			name:        "versioned tag match major",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v33"),
+			minversion:  "v0.3",
+		},
+		{
+			name:        "versioned tag match minor",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v33.0"),
+			minversion:  "v0.3",
+		},
+		{
+			name:        "versioned tag match patch",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v33.0.4"),
+			minversion:  "v0.3",
+		},
+		{
+			name:        "versioned tag mismatch patch",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v33.0.5"),
+			minversion:  "v0.3",
+			err:         serrors.ErrorMismatchVersionedTag,
+		},
+		{
+			name:        "versioned tag mismatch minor",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v33.1"),
+			minversion:  "v0.3",
+			err:         serrors.ErrorMismatchVersionedTag,
+		},
+		{
+			name:        "versioned tag mismatch major",
+			artifact:    "gcloud-container-github-tag",
+			provenance:  "gcloud-container-github-tag.json",
+			source:      "github.com/slsa-framework/example-package",
+			pversiontag: pString("v35"),
+			minversion:  "v0.3",
+			err:         serrors.ErrorMismatchVersionedTag,
+		},
 		// TODO(388): verify the correct provenance is returned.
 		// This should also be done for all other entries in this test.
 		{
@@ -1143,6 +1198,7 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 			artifact:   "index.docker.io/laurentsimon/scorecard",
 			noversion:  true,
 			remote:     true,
+			noDigest:   true,
 			source:     "github.com/laurentsimon/gcb-tests",
 			provenance: "gcloud-container-github.json",
 			pBuilderID: pString(builder + "@v0.2"),
@@ -1167,7 +1223,7 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 				builderIDs := []string{builder + "@" + semver, builder}
 				provenance := filepath.Clean(filepath.Join(TEST_DIR, v, tt.provenance))
 				image := tt.artifact
-				var fn verify.ComputeDigestFn
+				digestFn := container.GetImageDigest
 
 				// If builder ID is set, use it.
 				if tt.pBuilderID != nil {
@@ -1186,10 +1242,20 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 					}
 					image = fmt.Sprintf("%s@sha256:%s", image, digest)
 				}
+
 				// If it is a local image, change the digest computation.
 				if !tt.remote {
 					image = filepath.Clean(filepath.Join(TEST_DIR, v, image))
-					fn = localDigestComputeFn
+					digestFn = localDigestCompute
+				}
+
+				if len(tt.artifactDigest) == 0 && !tt.noDigest {
+					// Compute the digest and append it to the image so that's it 'immutable'.
+					digest, err := digestFn(image)
+					if err != nil {
+						panic(fmt.Sprintf("digest computation %v", err))
+					}
+					image = fmt.Sprintf("%v@sha256:%v", image, digest)
 				}
 
 				// We run the test for each builderID, in order to test
@@ -1200,9 +1266,8 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 						SourceURI:        tt.source,
 						SourceBranch:     nil,
 						BuilderID:        &bid,
-						SourceTag:        nil,
-						SourceVersionTag: nil,
-						DigestFn:         fn,
+						SourceTag:        tt.ptag,
+						SourceVersionTag: tt.pversiontag,
 						ProvenancePath:   &provenance,
 					}
 
@@ -1226,6 +1291,150 @@ func Test_runVerifyGCBArtifactImage(t *testing.T) {
 					// Validate against builderID we generated automatically.
 					if err := outBuilderID.Matches(bid, false); err != nil {
 						t.Errorf(fmt.Sprintf("matches failed: %v", err))
+					}
+				}
+			}
+		})
+	}
+}
+
+// TODO(https://github.com/slsa-framework/slsa-verifier/issues/485): Version the test-cases
+// when a version for the builder is released.
+func Test_runVerifyGHADockerBased(t *testing.T) {
+	// We cannot use t.Setenv due to parallelized tests.
+	os.Setenv("SLSA_VERIFIER_EXPERIMENTAL", "1")
+
+	t.Parallel()
+
+	builder := "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"
+	tests := []struct {
+		name        string
+		artifacts   []string
+		source      string
+		pbranch     *string
+		ptag        *string
+		pversiontag *string
+		pBuilderID  *string
+		inputs      map[string]string
+		err         error
+	}{
+		{
+			name:       "valid main branch default",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+		},
+		{
+			name:       "valid main branch default - invalid builderID",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/not-trusted.yml"),
+			err:        serrors.ErrorUntrustedReusableWorkflow,
+		},
+		{
+			name:       "valid main branch set",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			pbranch:    pString("main"),
+		},
+
+		{
+			name:       "wrong branch master",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-package",
+			pbranch:    pString("master"),
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			err:        serrors.ErrorMismatchBranch,
+		},
+		{
+			name:       "wrong source append A",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-packageA",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			err:        serrors.ErrorMismatchSource,
+		},
+		{
+			name:       "wrong source prepend A",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "Agithub.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			err:        serrors.ErrorMismatchSource,
+		},
+		{
+			name:       "wrong source middle A",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/Aslsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			err:        serrors.ErrorMismatchSource,
+		},
+		{
+			name:       "tag no match empty tag workflow_dispatch",
+			artifacts:  []string{"workflow_dispatch.main.default"},
+			source:     "github.com/slsa-framework/example-package",
+			pBuilderID: pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			ptag:       pString("v1.2.3"),
+			err:        serrors.ErrorMismatchTag,
+		},
+		{
+			name:        "versioned tag no match empty tag workflow_dispatch",
+			artifacts:   []string{"workflow_dispatch.main.default"},
+			source:      "github.com/slsa-framework/example-package",
+			pBuilderID:  pString("https://github.com/slsa-framework/slsa-github-generator/.github/workflows/builder_docker-based_slsa3.yml"),
+			pversiontag: pString("v1"),
+			err:         serrors.ErrorInvalidSemver,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt // Re-initializing variable so it is not changed while executing the closure below
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			checkVersions := getBuildersAndVersions(t, "", nil, GHA_ARTIFACT_DOCKER_BUILDERS)
+
+			for _, v := range checkVersions {
+				testPath := filepath.Clean(filepath.Join(TEST_DIR, v, tt.artifacts[0]))
+				provenancePath := fmt.Sprintf("%s.intoto.sigstore", testPath)
+
+				artifacts := make([]string, len(tt.artifacts))
+				for i, artifact := range tt.artifacts {
+					artifacts[i] = filepath.Clean(filepath.Join(TEST_DIR, v, artifact))
+				}
+
+				// For each test, we run 2 sub-tests:
+				//	1. With the the full builderID including the semver in short form.
+				//	2. With the the full builderID including the semver in long form.
+				//	3. With only the name of the builder.
+				//	4. With no builder ID.
+				sv := path.Base(v)
+				builderIDs := []*string{
+					pString(builder + "@" + sv),
+					pString(builder + "@refs/tags/" + sv),
+					pString(builder),
+					nil,
+				}
+
+				// If builder ID is set, use it.
+				if tt.pBuilderID != nil {
+					builderIDs = []*string{tt.pBuilderID}
+				}
+
+				for _, bid := range builderIDs {
+					cmd := verify.VerifyArtifactCommand{
+						ProvenancePath:      provenancePath,
+						SourceURI:           tt.source,
+						SourceBranch:        tt.pbranch,
+						BuilderID:           bid,
+						SourceTag:           tt.ptag,
+						SourceVersionTag:    tt.pversiontag,
+						BuildWorkflowInputs: tt.inputs,
+					}
+
+					// The outBuilderID is the actual builder ID from the provenance.
+					// This is always long form for the GHA builders.
+					_, err := cmd.Exec(context.Background(), artifacts)
+					if !errCmp(err, tt.err) {
+						t.Errorf("%v: %v", v, cmp.Diff(err, tt.err, cmpopts.EquateErrors()))
 					}
 				}
 			}

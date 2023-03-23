@@ -17,9 +17,7 @@ package verify
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/slsa-framework/slsa-verifier/v2/options"
@@ -40,10 +38,10 @@ type VerifyArtifactCommand struct {
 }
 
 func (c *VerifyArtifactCommand) Exec(ctx context.Context, artifacts []string) (*utils.TrustedBuilderID, error) {
-	var builderId *utils.TrustedBuilderID
+	var builderID *utils.TrustedBuilderID
 
 	for _, artifact := range artifacts {
-		artifactHash, err := getArtifactHash(artifact)
+		artifactHash, err := computeFileHash(artifact, sha256.New())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Verifying artifact %s: FAILED: %v\n\n", artifact, err)
 			return nil, err
@@ -78,28 +76,15 @@ func (c *VerifyArtifactCommand) Exec(ctx context.Context, artifacts []string) (*
 			fmt.Fprintf(os.Stdout, "%s\n", string(verifiedProvenance))
 		}
 
-		if builderId == nil {
-			builderId = outBuilderID
-		} else if *builderId != *outBuilderID {
-			err := fmt.Errorf("Encountered different builderIDs %v %v\n", builderId, outBuilderID)
+		if builderID == nil {
+			builderID = outBuilderID
+		} else if *builderID != *outBuilderID {
+			err := fmt.Errorf("encountered different builderIDs %v %v", builderID, outBuilderID)
 			fmt.Fprintf(os.Stderr, "Verifying artifact %s: FAILED: %v\n\n", artifact, err)
 			return nil, err
 		}
 		fmt.Fprintf(os.Stderr, "Verifying artifact %s: PASSED\n\n", artifact)
 	}
 
-	return builderId, nil
-}
-
-func getArtifactHash(artifactPath string) (string, error) {
-	f, err := os.Open(artifactPath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return builderID, nil
 }

@@ -16,10 +16,6 @@ func check(err error) {
 	}
 }
 
-func ExperimentalEnabled() bool {
-	return os.Getenv("SLSA_VERIFIER_EXPERIMENTAL") == "1"
-}
-
 func rootCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "slsa-verifier",
@@ -33,6 +29,7 @@ For more information on SLSA, visit https://slsa.dev`,
 	c.AddCommand(version.Version())
 	c.AddCommand(verifyArtifactCmd())
 	c.AddCommand(verifyImageCmd())
+	c.AddCommand(verifyNpmPackageCmd())
 	// We print our own errors and usage in the check function.
 	c.SilenceErrors = true
 	return c
